@@ -17,11 +17,11 @@ const fileFilter = (req, file, cb) => {
   cb(new Error('Only PDF files are allowed!'));
 };
 
-// Configure upload middleware
+// Configure upload middleware (memory storage for GridFS - buffer is uploaded to MongoDB)
 const upload = multer({ 
   storage: storage,
   limits: { 
-    fileSize: process.env.UPLOAD_LIMIT * 1024 * 1024 // Limit file size (default 10MB)
+    fileSize: (parseInt(process.env.UPLOAD_LIMIT, 10) || 10) * 1024 * 1024 // Default 10MB
   },
   fileFilter: fileFilter
 });

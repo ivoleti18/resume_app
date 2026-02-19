@@ -1,9 +1,7 @@
 const { Resume, Company, Keyword, User } = require('../models');
-const { uploadFile, deleteFile, s3Client } = require('../utils/s3');
+const { uploadFile: uploadToGridFS, deleteFile: deleteFromGridFS, streamFileToResponse } = require('../utils/gridfs');
 const { parseResume } = require('../utils/resumeParser');
 const mongoose = require('mongoose');
-const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
-const { GetObjectCommand } = require("@aws-sdk/client-s3");
 
 /**
  * Format text in title case (first letter of each word capitalized, rest lowercase)
@@ -74,7 +72,7 @@ const findOrCreateKeywords = async (keywordNames) => {
 const uploadResume = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
-  let s3Key = null;
+  let gridfsFileId = null;
   let currentStep = 'initialization';
   const originalFilename = req.file?.originalname || 'Unnamed file';
 
@@ -231,29 +229,20 @@ const uploadResume = async (req, res) => {
 
     console.log(`[${originalFilename}] Data processed. Name: "${name}", Major: "${major}", GradYear: "${graduationYear}", Unique Companies: ${uniqueCompanyList.length}, Unique Keywords: ${uniqueKeywordList.length}`);
 
-    // Generate S3 key for the file
-    const timestamp = Date.now();
-    const sanitizedName = name.toLowerCase().replace(/[^a-z0-9]/g, '_').substring(0, 100); // Ensure sanitization doesn't create empty string
-    const safeSanitizedName = sanitizedName || `resume_${timestamp}`; // Fallback if name sanitization results in empty
-    s3Key = `resumes/${safeSanitizedName}_${timestamp}.pdf`;
-
-    // Upload file to S3 with proper error handling
-    currentStep = 's3_upload';
-    let pdfUrl;
+    // Upload file to GridFS
+    currentStep = 'gridfs_upload';
     try {
-      console.log(`[${originalFilename}] Uploading file to S3 as: ${s3Key}`);
-      pdfUrl = await uploadFile(
-        req.file.buffer,
-        s3Key,
-        'application/pdf'
-      );
-      console.log(`[${originalFilename}] S3 upload successful: ${pdfUrl}`);
-    } catch (s3Error) {
-      // Critical failure: S3 upload failed. We cannot proceed without the file URL.
-      console.error(`[${originalFilename}] CRITICAL S3 upload error for key ${s3Key}:`, s3Error);
+      const timestamp = Date.now();
+      const safeFilename = (originalFilename || `resume_${timestamp}.pdf`).replace(/[^a-zA-Z0-9._-]/g, '_');
+      console.log(`[${originalFilename}] Uploading file to GridFS as: ${safeFilename}`);
+      const { fileId } = await uploadToGridFS(req.file.buffer, safeFilename, 'application/pdf');
+      gridfsFileId = fileId;
+      console.log(`[${originalFilename}] GridFS upload successful. fileId: ${fileId}`);
+    } catch (gridfsError) {
+      console.error(`[${originalFilename}] CRITICAL GridFS upload error:`, gridfsError);
       await session.abortTransaction();
       await session.endSession();
-      throw new Error(`S3 upload failed: ${s3Error.message}`);
+      throw new Error(`File storage failed: ${gridfsError.message}`);
     }
 
     // Find or create companies and keywords
@@ -298,8 +287,7 @@ const uploadResume = async (req, res) => {
         name,
         major,
         graduationYear,
-        pdfUrl, // Use the confirmed S3 URL
-        s3Key,   // Use the confirmed S3 key
+        fileId: gridfsFileId,
         uploadedBy: req.user.id || 'admin',
         companies: companyIds,
         keywords: keywordIds
@@ -328,66 +316,46 @@ const uploadResume = async (req, res) => {
         name: resume.name,
         major: resume.major,
         graduationYear: resume.graduationYear,
-        pdfUrl: resume.pdfUrl,
-        // Include parsing error message if one occurred, even on success
         parsingWarning: parsingErrorMessage,
-        companies: uniqueCompanyList, // Return the unique lists used
+        companies: uniqueCompanyList,
         keywords: uniqueKeywordList
       }
     });
   } catch (error) {
     console.error(`[${originalFilename}] Upload failed at step: ${currentStep}. Error: ${error.message}`);
 
-    // Abort transaction if it exists and hasn't been committed
     if (session.inTransaction()) {
       try {
-        console.log(`[${originalFilename}] Aborting transaction due to error...`);
         await session.abortTransaction();
-         console.log(`[${originalFilename}] Transaction aborted successfully.`);
       } catch (abortError) {
         console.error(`[${originalFilename}] CRITICAL: Error aborting transaction:`, abortError);
       }
     }
     await session.endSession();
 
-    // If we created an S3 file but the database operation failed AFTER S3 upload, try to clean up the S3 file
-    // Only attempt delete if s3Key is set AND the error occurred AFTER s3_upload step
-    const errorAfterS3 = ['associate_companies', 'associate_keywords', 'database_create', 'transaction_commit'].includes(currentStep);
-    if (s3Key && errorAfterS3) {
+    // Clean up GridFS file if we uploaded but DB failed after
+    const errorAfterGridFS = ['associate_companies', 'associate_keywords', 'database_create', 'transaction_commit'].includes(currentStep);
+    if (gridfsFileId && errorAfterGridFS) {
       try {
-        console.log(`[${originalFilename}] Cleaning up S3 file (${s3Key}) after error...`);
-        await deleteFile(s3Key);
-        console.log(`[${originalFilename}] S3 file cleanup successful.`);
+        await deleteFromGridFS(gridfsFileId);
       } catch (deleteError) {
-        // Log this error but don't overwrite the original error response
-        console.error(`[${originalFilename}] Error cleaning up S3 file (${s3Key}) after failed upload:`, deleteError);
+        console.error(`[${originalFilename}] Error cleaning up GridFS file after failed upload:`, deleteError);
       }
-    } else if (s3Key) {
-       console.log(`[${originalFilename}] S3 cleanup skipped. Error occurred at or before S3 upload step (${currentStep}).`);
     }
 
-    // Log the detailed error
-    console.error(`[${originalFilename}] Full error details:`, JSON.stringify({
-      name: error.name,
-      message: error.message,
-      step: currentStep,
-      stack: error.stack?.split('\n').slice(0, 5).join('\n'), // Limit stack trace length
-      code: error.code
-    }, null, 2));
+    console.error(`[${originalFilename}] Full error details:`, error.message);
 
-    // Provide more specific error messages based on the error type and step
     let userMessage = `Error uploading resume "${originalFilename}" during step: ${currentStep}.`;
     if (currentStep === 'resume_parsing') {
       userMessage = `Failed to parse resume content for "${originalFilename}". Please check if the PDF is valid and not password-protected.`;
     } else if (currentStep === 'database_create' && error.message.includes('null')) {
-      userMessage = `Failed to save resume "${originalFilename}" due to missing required data (e.g., name, major, grad year) after parsing. Check PDF content.`;
+      userMessage = `Failed to save resume "${originalFilename}" due to missing required data. Check PDF content.`;
     } else if (error.name === 'MongoServerError' && error.code === 11000) {
       userMessage = `A resume similar to "${originalFilename}" might already exist.`;
-    } else if (currentStep === 's3_upload' || error.message.includes('S3')) {
+    } else if (currentStep === 'gridfs_upload' || error.message.includes('storage')) {
       userMessage = `Error storing the file for resume "${originalFilename}". Please try again.`;
     } else {
-       // Generic fallback for other errors
-       userMessage = `An unexpected error occurred while processing "${originalFilename}": ${error.message}`;
+      userMessage = `An unexpected error occurred while processing "${originalFilename}": ${error.message}`;
     }
 
     res.status(500).json({ error: true, message: userMessage, details: error.message });
@@ -514,38 +482,23 @@ const searchResumes = async (req, res) => {
       .populate('keywords', 'name')
       .sort({ createdAt: -1 });
     
-    // Generate signed URLs and format the response
-    const formattedResumes = await Promise.all(resumes.map(async (resume) => {
-      let signedPdfUrl = null;
+    // Build file URL for each resume (GridFS stream endpoint)
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    const formattedResumes = resumes.map((resume) => {
       const associatedCompanies = resume.companies ? resume.companies.map(c => c.name) : [];
       const associatedKeywords = resume.keywords ? resume.keywords.map(k => k.name) : [];
-
-      if (resume.s3Key) { // Only generate if s3Key exists
-        try {
-          const command = new GetObjectCommand({
-            Bucket: process.env.AWS_BUCKET_NAME || process.env.AWS_S3_BUCKET,
-            Key: resume.s3Key,
-          });
-          // Generate signed URL valid for 15 minutes (adjust as needed)
-          signedPdfUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 }); 
-        } catch (urlError) {
-          console.error(`Error generating signed URL for key ${resume.s3Key}:`, urlError);
-          // Keep signedPdfUrl as null if generation fails
-        }
-      }
-
+      const fileUrl = resume.fileId ? `${baseUrl}/api/resumes/${resume._id}/file` : null;
       return {
         id: resume._id,
         name: resume.name,
         major: resume.major,
         graduationYear: resume.graduationYear,
-        pdfUrl: resume.pdfUrl, // Keep original URL if needed for other purposes
-        signedPdfUrl: signedPdfUrl, // Add the signed URL
-        s3Key: resume.s3Key, // Include s3Key for potential debugging
+        pdfUrl: fileUrl,
+        signedPdfUrl: fileUrl,
         companies: associatedCompanies,
         keywords: associatedKeywords
       };
-    }));
+    });
     
     res.status(200).json({
       error: false,
@@ -555,6 +508,28 @@ const searchResumes = async (req, res) => {
   } catch (error) {
     console.error('Resume search error:', error);
     res.status(500).json({ error: true, message: 'Error searching resumes.' });
+  }
+};
+
+// Stream PDF file from GridFS (GET /resumes/:id/file)
+const getResumeFile = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: true, message: 'Invalid resume ID.' });
+    }
+    const resume = await Resume.findOne({ _id: id, isActive: true }).select('fileId name').lean();
+    if (!resume || !resume.fileId) {
+      return res.status(404).json({ error: true, message: 'Resume or file not found.' });
+    }
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${(resume.name || 'resume').replace(/[^a-zA-Z0-9._-]/g, '_')}.pdf"`);
+    await streamFileToResponse(resume.fileId, res);
+  } catch (error) {
+    console.error('Get resume file error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: true, message: 'Error retrieving file.' });
+    }
   }
 };
 
@@ -569,31 +544,23 @@ const getResumeById = async (req, res) => {
     
     const resume = await Resume.findOne({ _id: id, isActive: true })
       .populate('companies', 'name')
-      .populate('keywords', 'name')
-      .populate({
-        path: 'uploadedBy',
-        select: 'firstName lastName email',
-        model: User
-      });
+      .populate('keywords', 'name');
     
     if (!resume) {
       return res.status(404).json({ error: true, message: 'Resume not found.' });
     }
     
-    // Format the response
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    const pdfUrl = resume.fileId ? `${baseUrl}/api/resumes/${resume._id}/file` : null;
     const formattedResume = {
       id: resume._id,
       name: resume.name,
       major: resume.major,
       graduationYear: resume.graduationYear,
-      pdfUrl: resume.pdfUrl,
+      pdfUrl,
       companies: resume.companies ? resume.companies.map(c => c.name) : [],
       keywords: resume.keywords ? resume.keywords.map(k => k.name) : [],
-      uploader: resume.uploadedBy ? {
-        id: resume.uploadedBy._id,
-        name: `${resume.uploadedBy.firstName} ${resume.uploadedBy.lastName}`,
-        email: resume.uploadedBy.email
-      } : null,
+      uploader: resume.uploadedBy ? { id: resume.uploadedBy } : null,
       createdAt: resume.createdAt,
       updatedAt: resume.updatedAt
     };
@@ -669,13 +636,14 @@ const updateResume = async (req, res) => {
       .populate('companies', 'name')
       .populate('keywords', 'name');
     
-    // Format the response
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    const pdfUrl = updatedResume.fileId ? `${baseUrl}/api/resumes/${updatedResume._id}/file` : null;
     const formattedResume = {
       id: updatedResume._id,
       name: updatedResume.name,
       major: updatedResume.major,
       graduationYear: updatedResume.graduationYear,
-      pdfUrl: updatedResume.pdfUrl,
+      pdfUrl,
       companies: updatedResume.companies ? updatedResume.companies.map(c => c.name) : [],
       keywords: updatedResume.keywords ? updatedResume.keywords.map(k => k.name) : []
     };
@@ -686,10 +654,8 @@ const updateResume = async (req, res) => {
       data: formattedResume
     });
   } catch (error) {
-    // Roll back transaction on error
     await session.abortTransaction();
     await session.endSession();
-    
     console.error('Resume update error:', error);
     res.status(500).json({ error: true, message: 'Error updating resume.' });
   }
@@ -729,8 +695,10 @@ const deleteResume = async (req, res) => {
     resume.isActive = false;
     await resume.save({ session });
     
-    // Delete the file from S3
-    await deleteFile(resume.s3Key);
+    // Delete the file from GridFS
+    if (resume.fileId) {
+      await deleteFromGridFS(resume.fileId).catch(err => console.error('GridFS delete error:', err));
+    }
     
     // Commit transaction
     await session.commitTransaction();
@@ -763,9 +731,9 @@ const deleteAllResumes = async (req, res) => {
       return res.status(403).json({ error: true, message: 'Permission denied. Admin access required.' });
     }
     
-    // Get all active resumes to delete their S3 files
+    // Get all active resumes to delete their GridFS files
     const allResumes = await Resume.find({ isActive: true })
-      .select('s3Key')
+      .select('fileId')
       .session(session);
     
     if (allResumes.length === 0) {
@@ -781,12 +749,11 @@ const deleteAllResumes = async (req, res) => {
       { session }
     );
     
-    // Delete all files from S3
+    // Delete all files from GridFS
     const deletePromises = allResumes.map(resume => {
-      if (resume.s3Key) {
-        return deleteFile(resume.s3Key).catch(err => {
-          console.error(`Error deleting S3 file ${resume.s3Key}:`, err);
-          // Continue with other deletions even if one fails
+      if (resume.fileId) {
+        return deleteFromGridFS(resume.fileId).catch(err => {
+          console.error(`Error deleting GridFS file ${resume.fileId}:`, err);
           return Promise.resolve();
         });
       }
@@ -860,6 +827,7 @@ module.exports = {
   uploadResume,
   searchResumes,
   getResumeById,
+  getResumeFile,
   updateResume,
   deleteResume,
   deleteAllResumes,

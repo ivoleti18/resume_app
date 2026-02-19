@@ -16,13 +16,11 @@ const resumeSchema = new mongoose.Schema({
     required: true,
     trim: true
   },
-  pdfUrl: {
-    type: String,
-    required: true
-  },
-  s3Key: {
-    type: String,
-    required: true
+  /** GridFS file ID - references the PDF in MongoDB (resumes.files / resumes.chunks) */
+  fileId: {
+    type: mongoose.Schema.Types.ObjectId,
+    required: true,
+    ref: 'resumes.files'
   },
   uploadedBy: {
     type: String,

@@ -3,6 +3,7 @@ const {
   uploadResume, 
   searchResumes, 
   getResumeById, 
+  getResumeFile,
   updateResume, 
   deleteResume,
   deleteAllResumes,
@@ -16,6 +17,7 @@ const router = express.Router();
 // Public routes
 router.get('/search', searchResumes);
 router.get('/filters', getFilters);
+router.get('/:id/file', getResumeFile);  // must be before /:id
 router.get('/:id', getResumeById);
 
 // Protected routes
