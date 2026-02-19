@@ -95,9 +95,6 @@ export function AuthProvider({ children }) {
 
     // Reset admin context state
     setUser(null);
-
-    // Also clear Supabase flag for good measure (does nothing if already gone)
-    localStorage.removeItem('supabaseAuth');
   };
 
   // Context value

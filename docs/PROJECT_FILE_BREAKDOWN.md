@@ -51,8 +51,6 @@ Overview of all source files in the resume app (excluding `node_modules` and `.n
 | `api.js` | Axios instance + interceptors; `authAPI`, `resumeAPI`, `companyAPI`, `keywordAPI` |
 | `AuthContext.js` | Admin auth context (login state, token, logout) |
 | `MemberAuthContext.js` | Member auth: sign in/up/out via backend, JWT in localStorage, `useMemberAuth` |
-| `SupabaseAuthContext.js` | **Legacy** – was used for Supabase; can be removed |
-| `supabaseClient.js` | **Legacy** – Supabase client; can be removed |
 | `utils.js` | Shared frontend helpers |
 
 ### Middleware
@@ -69,8 +67,8 @@ Overview of all source files in the resume app (excluding `node_modules` and `.n
 
 | File | Purpose |
 |------|--------|
-| `package.json` | Backend deps (express, mongoose, bcrypt, jwt, multer, aws-sdk, pdf-parse, etc.) and scripts: `start`, `dev`, `seed` |
-| `.env` | Backend env: `MONGODB_URI`, `JWT_SECRET`, AWS, etc. (not committed) |
+| `package.json` | Backend deps (express, mongoose, bcrypt, jwt, multer, pdf-parse, etc.) and scripts: `start`, `dev`, `seed` |
+| `.env` | Backend env: `MONGODB_URI`, `JWT_SECRET`, etc. (not committed) |
 | `README.md` | Backend setup/run instructions |
 | `src/server.js` | Express app: CORS, JSON, routes at `/api`, health check, error handler; calls `connectDB()` then listens |
 | `src/config/database.js` | **Mongoose connect** – `connectDB()` uses `MONGODB_URI`, calls `mongoose.connect()` |
@@ -81,14 +79,14 @@ Overview of all source files in the resume app (excluding `node_modules` and `.n
 |------|--------|
 | `index.js` | Mounts `/auth` and `/resumes` under `/api` |
 | `authRoutes.js` | `POST /admin/login`, `POST /register`, `POST /member/login`, `POST /login` (unified), `GET /me`, `GET /admin/profile` |
-| `resumeRoutes.js` | `GET /search`, `GET /filters`, `GET /:id`, `POST /` (upload), `PUT /:id`, `DELETE /:id`, `DELETE /all/delete` (admin) |
+| `resumeRoutes.js` | `GET /search`, `GET /filters`, `GET /:id/file` (stream PDF), `GET /:id`, `POST /` (upload), `PUT /:id`, `DELETE /:id`, `DELETE /all/delete` (admin) |
 
 ### Controllers (`backend/src/controllers/`)
 
 | File | Purpose |
 |------|--------|
 | `authController.js` | Admin login; member register/login; `getCurrentUser` (admin or member from JWT) |
-| `resumeController.js` | Upload (parse PDF, S3, MongoDB), search, getById, update, delete, deleteAll, getFilters (all using Mongoose) |
+| `resumeController.js` | Upload (parse PDF, GridFS, MongoDB), search, getById, getResumeFile (stream PDF), update, delete, deleteAll, getFilters (Mongoose + GridFS) |
 
 ### Models (`backend/src/models/`) – Mongoose
 
@@ -96,7 +94,7 @@ Overview of all source files in the resume app (excluding `node_modules` and `.n
 |------|--------|
 | `index.js` | Exports `User`, `Resume`, `Company`, `Keyword` |
 | `User.js` | Schema: email, password (hashed), firstName, lastName, role, isActive |
-| `Resume.js` | Schema: name, major, graduationYear, pdfUrl, s3Key, uploadedBy, companies[], keywords[], isActive |
+| `Resume.js` | Schema: name, major, graduationYear, fileId (GridFS), uploadedBy, companies[], keywords[], isActive |
 | `Company.js` | Schema: name (unique) |
 | `Keyword.js` | Schema: name (unique) |
 
@@ -112,7 +110,7 @@ Overview of all source files in the resume app (excluding `node_modules` and `.n
 | File | Purpose |
 |------|--------|
 | `jwt.js` | `generateToken`, `verifyToken` (using `JWT_SECRET`) |
-| `s3.js` | Upload/delete file in S3; presigned URL; uses AWS env vars |
+| `gridfs.js` | Upload/delete/stream PDFs in MongoDB GridFS (bucket `resumes`) |
 | `resumeParser.js` | Parse PDF (pdf-parse) and optionally extract text with Gemini |
 
 ### Scripts (`backend/src/scripts/`)
@@ -138,13 +136,11 @@ Overview of all source files in the resume app (excluding `node_modules` and `.n
 
 | File | Purpose |
 |------|--------|
-| `public/pdf.worker.js` | PDF.js worker for client-side PDF rendering |
-| `public/pdf-worker/pdf.worker.min.js` | Alternative/minified PDF.js worker |
+| `public/pdf.worker.js` | PDF.js worker for client-side PDF rendering (if using react-pdf Document/Page) |
 
 ---
 
 ## Summary
 
 - **Frontend**: Next.js 15 app; member auth via `MemberAuthContext` + backend JWT; admin auth via `AuthContext`; resume search protected by `ProtectedRoute`.
-- **Backend**: Express API under `/api`; MongoDB via Mongoose (`connectDB` in `backend/src/config/database.js`); auth (admin + member) and resume CRUD + S3 and PDF parsing.
-- **Legacy**: `src/lib/SupabaseAuthContext.js` and `src/lib/supabaseClient.js` can be deleted after confirming everything uses `MemberAuthContext` and the backend.
+- **Backend**: Express API under `/api`; MongoDB via Mongoose + GridFS; auth (admin + member) and resume CRUD with PDFs stored in GridFS.
